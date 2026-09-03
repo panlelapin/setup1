@@ -2,6 +2,20 @@
 # linux & macos (brew):
 NONINTERACTIVE=1 /bin/bash -c \
     "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" && \
+{    command -v brew >/dev/null 2>&1 || \
+        export PATH="/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:$PATH"
+    eval "$(brew shellenv)" && \
+        brew install -y git gh }
+
+
+
+
+
+
+
+
+NONINTERACTIVE=1 /bin/bash -c \
+    "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" && \
 if [ -x /opt/homebrew/bin/brew ]; then
     eval "$(/opt/homebrew/bin/brew shellenv)"
 elif [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
