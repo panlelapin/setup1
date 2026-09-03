@@ -21,10 +21,12 @@ then
 # gh & git setup (needs web)
 gh auth login --web && gh auth setup-git && \
 git config --global user.name "$(gh api user --jq '.name // .login')" && \
-git config --global user.email "$(gh api user --jq '"\(.id)+\(.login)@users.noreply.github.com"')"
+git config --global user.email \
+"$(gh api user --jq '"\(.id)+\(.login)@users.noreply.github.com"')"
 ```
 and
 ```sh
 # hand over to private repo
-export pd="$HOME/p" && mkdir -p "$pd" && gh repo clone setup "$pd/setup2" && bash "$pd/setup2/setup2.sh"
+export pd="$HOME/p" && mkdir -p "$pd" && gh repo clone setup "$pd/setup2" && \
+bash "$pd/setup2/setup2.sh"
 ```
