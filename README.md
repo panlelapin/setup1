@@ -1,7 +1,6 @@
 ```sh
 # homebrew install (linux & macos):
-NONINTERACTIVE=1 \
-/bin/bash -c \
+NONINTERACTIVE=1 /bin/bash -c \
 "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" && \
 command -v brew >/dev/null 2>&1 || \
     export PATH="/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:$PATH"
