@@ -19,9 +19,6 @@ sudo apt update && sudo apt install -y git gh
 ```sh
 # gh & git setup (needs web)
 gh auth login --web && gh auth setup-git && \
-git config --global user.name \
-"$(gh api user --jq '.name // .login')" && \
-git config --global user.email \
-"$(gh api user --jq \
-'"\(.id)+\(.login)@users.noreply.github.com"')"
+git config --global user.name "$(gh api user --jq '.name // .login')" && \
+git config --global user.email "$(gh api user --jq '"\(.id)+\(.login)@users.noreply.github.com"')"
 ```
