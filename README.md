@@ -26,7 +26,5 @@ git config --global user.email "$(gh api user --jq '"\(.id)+\(.login)@users.nore
 and
 ```sh
 # hand over to private repo
-export pd="$HOME/p" && mkdir -p "$pd" && \ export setupd="$pd/setup2"
-gh repo clone setup "$setupd" && \ bash "$setupd/($setupd).sh"
-
+export pd="$HOME/p" && mkdir -p "$pd" && gh repo clone setup "$pd/setup2" && bash "$pd/setup2/setup2.sh"
 ```
