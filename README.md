@@ -1,11 +1,9 @@
 ```sh
 # linux & macos (brew):
 NONINTERACTIVE=1 /bin/bash -c \
-    "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" && \
-{ command -v brew >/dev/null 2>&1 || \
-        export PATH="/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:$PATH"
-    eval "$(brew shellenv)" && \
-        brew install -y git gh }
+"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" && \
+export PATH="/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:$PATH" && \
+eval "$(brew shellenv)" && brew install -y git gh
 ```
 
 ```sh
