@@ -11,7 +11,8 @@ elif [ -x /usr/local/bin/brew ]; then
 else
     exit 1
 fi
-brew install -y git gh```
+brew install -y git gh
+```
 
 ```sh
 # termux:
