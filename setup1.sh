@@ -58,6 +58,7 @@ first_line() {
     printf '%s\n' "${value%%$'\n'*}"
 }
 
+# Find Homebrew even if it is not yet in PATH.
 find_brew() {
     local candidate
 
@@ -80,6 +81,9 @@ find_brew() {
     return 1
 }
 
+# Activate Homebrew and guarantee:
+#   PATH[0] = HOMEBREW_PREFIX/bin
+#   PATH[1] = HOMEBREW_PREFIX/sbin
 activate_brew() {
     local brew_bin
     local entry
@@ -147,6 +151,38 @@ check_brew_version() {
     pkgver="$(first_line "$output")"
 }
 
+ensure_shellenv_line() {
+    local rc_file="$1"
+    local shell_name="$2"
+    local line
+
+    line="eval \"\$(${brew_prefix}/bin/brew shellenv ${shell_name})\""
+    touch "$rc_file"
+
+    grep -Fqx "$line" "$rc_file" 2>/dev/null ||
+        printf '\n%s\n' "$line" >> "$rc_file"
+}
+
+persist_brew_path() {
+    [[ -n "$brew_prefix" ]] ||
+        die "HOMEBREW_PREFIX non défini"
+
+    case "$family" in
+        macos)
+            ensure_shellenv_line "$HOME/.zprofile" zsh
+            ensure_shellenv_line "$HOME/.zshrc" zsh
+            ensure_shellenv_line "$HOME/.bash_profile" bash
+            ensure_shellenv_line "$HOME/.bashrc" bash
+            ;;
+
+        fedora|fedora-atomic)
+            ensure_shellenv_line "$HOME/.zshrc" zsh
+            ensure_shellenv_line "$HOME/.bashrc" bash
+            ensure_shellenv_line "$HOME/.profile" sh
+            ;;
+    esac
+}
+
 # -----------------------------------------------------------------------------
 # CPU detection
 # -----------------------------------------------------------------------------
@@ -171,14 +207,17 @@ kernel="$(uname -s)"
 # Distribution detection
 # -----------------------------------------------------------------------------
 
+# macOS
 if [[ "$kernel" == "Darwin" ]]; then
     distro="macos"
     family="macos"
 
+    # A process translated by Rosetta may report x86_64 even on Apple Silicon.
     if [[ "$(sysctl -in hw.optional.arm64 2>/dev/null || true)" == "1" ]]; then
         cpu="arm64"
     fi
 
+# Termux
 elif [[ -n "${TERMUX_VERSION:-}" ]] ||
      [[ "${PREFIX:-}" == */com.termux/files/usr ]]; then
     distro="termux"
@@ -187,24 +226,31 @@ elif [[ -n "${TERMUX_VERSION:-}" ]] ||
     [[ "$cpu" == "arm64" ]] ||
         die "Termux non ARM64 non supporté"
 
+# Linux
 elif [[ "$kernel" == "Linux" && -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
     . /etc/os-release
 
     os_id="${ID:-unknown}"
     os_like=" ${ID_LIKE:-} "
     variant_id="${VARIANT_ID:-}"
 
+    # Exact distribution first.
     distro="$os_id"
 
+    # Preserve Fedora edition/variant information where useful.
     if [[ "$os_id" == "fedora" && -n "$variant_id" ]]; then
         distro="fedora-${variant_id}"
     fi
 
+    # Then classify it into the setup family.
     case "$os_id" in
+        # Universal Blue / Fedora Atomic derivatives.
         aurora|bluefin|bazzite)
             family="fedora-atomic"
             ;;
 
+        # Fedora official editions.
         fedora)
             case "$variant_id" in
                 silverblue|kinoite|sway-atomic|budgie-atomic|cosmic-atomic|sericea|onyx)
@@ -216,16 +262,20 @@ elif [[ "$kernel" == "Linux" && -r /etc/os-release ]]; then
             esac
             ;;
 
+        # Fedora Asahi Remix.
         fedora-asahi-remix)
             family="fedora"
             ;;
 
+        # Direct Debian family members.
         debian|ubuntu)
             family="debian"
             ;;
 
+        # Other derivatives classified from ID_LIKE.
         *)
             if [[ "$os_like" == *" fedora "* ]]; then
+                # OSTree marker catches additional Fedora Atomic derivatives.
                 if [[ -e /run/ostree-booted ]]; then
                     family="fedora-atomic"
                 else
@@ -240,6 +290,7 @@ elif [[ "$kernel" == "Linux" && -r /etc/os-release ]]; then
             ;;
     esac
 
+    # Fedora Asahi fallback if an image reports itself as Fedora.
     if [[ "$family" == "fedora" &&
           "$cpu" == "arm64" &&
           "$(uname -r)" == *asahi* ]]; then
@@ -265,6 +316,8 @@ case "$family" in
         ;;
 
     fedora)
+        # DNF is only the bootstrap package manager.
+        # Git, gh and the rest of this setup use Homebrew afterwards.
         require_cmd dnf
 
         dnf_output="$(dnf --version)" ||
@@ -285,6 +338,7 @@ case "$family" in
         ;;
 
     fedora-atomic)
+        # Atomic Fedora / Universal Blue must already ship/provide Homebrew.
         activate_brew ||
             die "Homebrew requis mais absent sur $distro"
 
@@ -304,6 +358,7 @@ case "$family" in
     termux)
         require_cmd pkg
 
+        # pkg has no useful standalone --version, so validate its backend.
         if command -v apt >/dev/null 2>&1; then
             termux_backend_output="$(apt --version)" ||
                 die "backend APT de pkg inutilisable"
@@ -333,6 +388,13 @@ case "$family" in
         die "famille non supportée: $family"
         ;;
 esac
+
+if [[ "$family" == "macos" ||
+      "$family" == "fedora" ||
+      "$family" == "fedora-atomic" ]]; then
+    persist_brew_path
+    activate_brew
+fi
 
 # -----------------------------------------------------------------------------
 # Detection report
@@ -364,6 +426,8 @@ info "Installation de git et gh"
 case "$family" in
     macos|fedora|fedora-atomic)
         HOMEBREW_NO_ASK=1 brew install -y git gh
+
+        # Re-assert Homebrew priority after formula installation.
         activate_brew
         ;;
 
