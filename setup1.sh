@@ -58,7 +58,6 @@ first_line() {
     printf '%s\n' "${value%%$'\n'*}"
 }
 
-# Find Homebrew even if it is not yet in PATH.
 find_brew() {
     local candidate
 
@@ -81,9 +80,6 @@ find_brew() {
     return 1
 }
 
-# Activate Homebrew and guarantee:
-#   PATH[0] = HOMEBREW_PREFIX/bin
-#   PATH[1] = HOMEBREW_PREFIX/sbin
 activate_brew() {
     local brew_bin
     local entry
@@ -91,7 +87,6 @@ activate_brew() {
     local -a path_entries
 
     brew_bin="$(find_brew)" || return 1
-
     eval "$("$brew_bin" shellenv)"
 
     brew_prefix="$(brew --prefix)" ||
@@ -118,35 +113,23 @@ activate_brew() {
 
     case "$PATH" in
         "${brew_prefix}/bin:${brew_prefix}/sbin"|\
-        "${brew_prefix}/bin:${brew_prefix}/sbin:"*)
-            ;;
-        *)
-            die "Homebrew sbin n'est pas deuxième dans PATH"
-            ;;
+        "${brew_prefix}/bin:${brew_prefix}/sbin:"*) ;;
+        *) die "Homebrew sbin n'est pas deuxième dans PATH" ;;
     esac
 }
 
 install_homebrew() {
     require_cmd curl
-
     info "Installation de Homebrew"
-
     NONINTERACTIVE=1 /bin/bash -c \
         "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-    activate_brew ||
-        die "Homebrew installé mais introuvable ou inutilisable"
+    activate_brew || die "Homebrew installé mais introuvable ou inutilisable"
 }
 
 check_brew_version() {
     local output
-
-    activate_brew ||
-        die "Homebrew introuvable"
-
-    output="$(brew --version)" ||
-        die "Homebrew inutilisable"
-
+    activate_brew || die "Homebrew introuvable"
+    output="$(brew --version)" || die "Homebrew inutilisable"
     pkgmgr="brew"
     pkgver="$(first_line "$output")"
 }
@@ -155,17 +138,23 @@ ensure_shellenv_line() {
     local rc_file="$1"
     local shell_name="$2"
     local line
-
     line="eval \"\$(${brew_prefix}/bin/brew shellenv ${shell_name})\""
     touch "$rc_file"
+    grep -Fqx "$line" "$rc_file" 2>/dev/null ||
+        printf '\n%s\n' "$line" >> "$rc_file"
+}
 
+ensure_fish_shellenv_line() {
+    local rc_file="$HOME/.config/fish/config.fish"
+    local line="eval (${brew_prefix}/bin/brew shellenv fish)"
+    mkdir -p "$HOME/.config/fish"
+    touch "$rc_file"
     grep -Fqx "$line" "$rc_file" 2>/dev/null ||
         printf '\n%s\n' "$line" >> "$rc_file"
 }
 
 persist_brew_path() {
-    [[ -n "$brew_prefix" ]] ||
-        die "HOMEBREW_PREFIX non défini"
+    [[ -n "$brew_prefix" ]] || die "HOMEBREW_PREFIX non défini"
 
     case "$family" in
         macos)
@@ -173,109 +162,67 @@ persist_brew_path() {
             ensure_shellenv_line "$HOME/.zshrc" zsh
             ensure_shellenv_line "$HOME/.bash_profile" bash
             ensure_shellenv_line "$HOME/.bashrc" bash
+            ensure_fish_shellenv_line
             ;;
-
         fedora|fedora-atomic)
             ensure_shellenv_line "$HOME/.zshrc" zsh
             ensure_shellenv_line "$HOME/.bashrc" bash
             ensure_shellenv_line "$HOME/.profile" sh
+            ensure_fish_shellenv_line
             ;;
     esac
 }
 
-# -----------------------------------------------------------------------------
-# CPU detection
-# -----------------------------------------------------------------------------
-
 machine="$(uname -m)"
-
 case "$machine" in
-    arm64|aarch64)
-        cpu="arm64"
-        ;;
-    x86_64|amd64)
-        cpu="x86_64"
-        ;;
-    *)
-        die "CPU non supporté: $machine"
-        ;;
+    arm64|aarch64) cpu="arm64" ;;
+    x86_64|amd64) cpu="x86_64" ;;
+    *) die "CPU non supporté: $machine" ;;
 esac
 
 kernel="$(uname -s)"
 
-# -----------------------------------------------------------------------------
-# Distribution detection
-# -----------------------------------------------------------------------------
-
-# macOS
 if [[ "$kernel" == "Darwin" ]]; then
     distro="macos"
     family="macos"
-
-    # A process translated by Rosetta may report x86_64 even on Apple Silicon.
     if [[ "$(sysctl -in hw.optional.arm64 2>/dev/null || true)" == "1" ]]; then
         cpu="arm64"
     fi
-
-# Termux
 elif [[ -n "${TERMUX_VERSION:-}" ]] ||
      [[ "${PREFIX:-}" == */com.termux/files/usr ]]; then
     distro="termux"
     family="termux"
-
-    [[ "$cpu" == "arm64" ]] ||
-        die "Termux non ARM64 non supporté"
-
-# Linux
+    [[ "$cpu" == "arm64" ]] || die "Termux non ARM64 non supporté"
 elif [[ "$kernel" == "Linux" && -r /etc/os-release ]]; then
-    # shellcheck disable=SC1091
     . /etc/os-release
-
     os_id="${ID:-unknown}"
     os_like=" ${ID_LIKE:-} "
     variant_id="${VARIANT_ID:-}"
-
-    # Exact distribution first.
     distro="$os_id"
 
-    # Preserve Fedora edition/variant information where useful.
     if [[ "$os_id" == "fedora" && -n "$variant_id" ]]; then
         distro="fedora-${variant_id}"
     fi
 
-    # Then classify it into the setup family.
     case "$os_id" in
-        # Universal Blue / Fedora Atomic derivatives.
         aurora|bluefin|bazzite)
             family="fedora-atomic"
             ;;
-
-        # Fedora official editions.
         fedora)
             case "$variant_id" in
                 silverblue|kinoite|sway-atomic|budgie-atomic|cosmic-atomic|sericea|onyx)
-                    family="fedora-atomic"
-                    ;;
-                *)
-                    family="fedora"
-                    ;;
+                    family="fedora-atomic" ;;
+                *) family="fedora" ;;
             esac
             ;;
-
-        # Fedora Asahi Remix.
         fedora-asahi-remix)
             family="fedora"
             ;;
-
-        # Direct Debian family members.
         debian|ubuntu)
             family="debian"
             ;;
-
-        # Other derivatives classified from ID_LIKE.
         *)
             if [[ "$os_like" == *" fedora "* ]]; then
-                # OSTree marker catches additional Fedora Atomic derivatives.
                 if [[ -e /run/ostree-booted ]]; then
                     family="fedora-atomic"
                 else
@@ -290,20 +237,13 @@ elif [[ "$kernel" == "Linux" && -r /etc/os-release ]]; then
             ;;
     esac
 
-    # Fedora Asahi fallback if an image reports itself as Fedora.
-    if [[ "$family" == "fedora" &&
-          "$cpu" == "arm64" &&
+    if [[ "$family" == "fedora" && "$cpu" == "arm64" &&
           "$(uname -r)" == *asahi* ]]; then
         distro="fedora-asahi-remix"
     fi
-
 else
     die "système non supporté: $kernel"
 fi
-
-# -----------------------------------------------------------------------------
-# Package-manager validation / Homebrew bootstrap
-# -----------------------------------------------------------------------------
 
 case "$family" in
     macos)
@@ -314,91 +254,52 @@ case "$family" in
             check_brew_version
         fi
         ;;
-
     fedora)
-        # DNF is only the bootstrap package manager.
-        # Git, gh and the rest of this setup use Homebrew afterwards.
         require_cmd dnf
-
-        dnf_output="$(dnf --version)" ||
-            die "DNF inutilisable"
-
+        dnf_output="$(dnf --version)" || die "DNF inutilisable"
         info "DNF détecté: $(first_line "$dnf_output")"
-
         if ! activate_brew; then
             info "Installation des prérequis Homebrew avec DNF"
-
             as_root dnf group install -y development-tools
             as_root dnf install -y procps-ng curl file
-
             install_homebrew
         fi
-
         check_brew_version
         ;;
-
     fedora-atomic)
-        # Atomic Fedora / Universal Blue must already ship/provide Homebrew.
-        activate_brew ||
-            die "Homebrew requis mais absent sur $distro"
-
+        activate_brew || die "Homebrew requis mais absent sur $distro"
         check_brew_version
         ;;
-
     debian)
         require_cmd apt
-
-        apt_output="$(apt --version)" ||
-            die "APT inutilisable"
-
+        apt_output="$(apt --version)" || die "APT inutilisable"
         pkgmgr="apt"
         pkgver="$(first_line "$apt_output")"
         ;;
-
     termux)
         require_cmd pkg
-
-        # pkg has no useful standalone --version, so validate its backend.
         if command -v apt >/dev/null 2>&1; then
-            termux_backend_output="$(apt --version)" ||
-                die "backend APT de pkg inutilisable"
-
+            termux_backend_output="$(apt --version)" || die "backend APT de pkg inutilisable"
             pkgmgr="pkg"
             pkgver="pkg / $(first_line "$termux_backend_output")"
         elif command -v pacman >/dev/null 2>&1; then
-            termux_backend_output="$(pacman --version)" ||
-                die "backend pacman de pkg inutilisable"
-
-            pacman_version="$(
-                printf '%s\n' "$termux_backend_output" |
-                awk '/Pacman v/ {print; exit}'
-            )"
-
-            [[ -n "$pacman_version" ]] ||
-                die "version du backend pacman introuvable"
-
+            termux_backend_output="$(pacman --version)" || die "backend pacman de pkg inutilisable"
+            pacman_version="$(printf '%s\n' "$termux_backend_output" | awk '/Pacman v/ {print; exit}')"
+            [[ -n "$pacman_version" ]] || die "version du backend pacman introuvable"
             pkgmgr="pkg"
             pkgver="pkg / $pacman_version"
         else
             die "pkg présent mais backend introuvable"
         fi
         ;;
-
-    *)
-        die "famille non supportée: $family"
-        ;;
+    *) die "famille non supportée: $family" ;;
 esac
 
-if [[ "$family" == "macos" ||
-      "$family" == "fedora" ||
+if [[ "$family" == "macos" || "$family" == "fedora" ||
       "$family" == "fedora-atomic" ]]; then
     persist_brew_path
     activate_brew
 fi
-
-# -----------------------------------------------------------------------------
-# Detection report
-# -----------------------------------------------------------------------------
 
 printf '\nDetected environment\n'
 printf '  distro : %s\n' "$distro"
@@ -410,32 +311,22 @@ printf '  version: %s\n' "$pkgver"
 if [[ "$pkgmgr" == "brew" ]]; then
     printf '  brew   : %s\n' "$brew_prefix"
     printf '  PATH[0]: %s\n' "${PATH%%:*}"
-
     [[ "${PATH%%:*}" == "${brew_prefix}/bin" ]] ||
         die "PATH invalide: ${brew_prefix}/bin doit être premier"
 fi
 
 printf '\n'
-
-# -----------------------------------------------------------------------------
-# Install Git + GitHub CLI
-# -----------------------------------------------------------------------------
-
 info "Installation de git et gh"
 
 case "$family" in
     macos|fedora|fedora-atomic)
         HOMEBREW_NO_ASK=1 brew install -y git gh
-
-        # Re-assert Homebrew priority after formula installation.
         activate_brew
         ;;
-
     debian)
         as_root apt update
         as_root apt install -y git gh
         ;;
-
     termux)
         pkg update
         pkg install -y git gh
@@ -443,51 +334,30 @@ case "$family" in
 esac
 
 hash -r
-
 require_cmd git
 require_cmd gh
 
-if [[ "$family" == "macos" ||
-      "$family" == "fedora" ||
+if [[ "$family" == "macos" || "$family" == "fedora" ||
       "$family" == "fedora-atomic" ]]; then
     [[ "$(command -v git)" == "${brew_prefix}/bin/git" ]] ||
         die "Git utilisé n'est pas celui de Homebrew: $(command -v git)"
-
     [[ "$(command -v gh)" == "${brew_prefix}/bin/gh" ]] ||
         die "gh utilisé n'est pas celui de Homebrew: $(command -v gh)"
 fi
 
 printf '  %s\n' "$(git --version)"
-
 gh_version="$(gh --version)"
 printf '  %s\n\n' "$(first_line "$gh_version")"
 
-# -----------------------------------------------------------------------------
-# GitHub authentication
-# -----------------------------------------------------------------------------
-
 info "Authentification GitHub"
-
 if ! gh auth status --hostname github.com >/dev/null 2>&1; then
-    gh auth login \
-        --hostname github.com \
-        --web \
-        --git-protocol https
+    gh auth login --hostname github.com --web --git-protocol https
 fi
 
 gh auth setup-git --hostname github.com
 
-# -----------------------------------------------------------------------------
-# Git identity from the authenticated GitHub profile
-# -----------------------------------------------------------------------------
-
 info "Configuration de l'identité Git"
-
-git_name="$(
-    gh api user --jq \
-        'if (.name // "") == "" then .login else .name end'
-)"
-
+git_name="$(gh api user --jq 'if (.name // "") == "" then .login else .name end')"
 git_login="$(gh api user --jq '.login')"
 git_id="$(gh api user --jq '.id')"
 git_email="${git_id}+${git_login}@users.noreply.github.com"
@@ -498,18 +368,9 @@ git config --global user.email "$git_email"
 printf '  user.name : %s\n' "$(git config --global user.name)"
 printf '  user.email: %s\n\n' "$(git config --global user.email)"
 
-# -----------------------------------------------------------------------------
-# Hand over to private repository
-# -----------------------------------------------------------------------------
-
 info "Passage au setup privé"
-
 mkdir -p "$PDIR"
 cd "$PDIR"
-
 gh repo clone "$PRIVATE_REPO" "$SETUP_DIR"
-
-[[ -f "$SETUP_SCRIPT" ]] ||
-    die "script privé introuvable: $SETUP_SCRIPT"
-
+[[ -f "$SETUP_SCRIPT" ]] || die "script privé introuvable: $SETUP_SCRIPT"
 bash "$SETUP_SCRIPT"
