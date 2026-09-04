@@ -40,7 +40,7 @@ set -euo pipefail
 #   1. document the desired state and per-platform ownership in this contract;
 #   2. validate every command/file/environment value before first use;
 #   3. detect whether the desired state is already satisfied;
-#   4. print `(déjà fait)` and skip mutation when it is already satisfied;
+#   4. report the step as `déjà fait` and skip mutation when already satisfied;
 #   5. otherwise perform the smallest necessary mutation;
 #   6. immediately verify the mutation using an independent state query;
 #   7. verify the executable actually selected by PATH, not just its package;
@@ -132,7 +132,7 @@ set -euo pipefail
 # This script MUST be safe to run repeatedly.
 # For every state-changing step:
 #   - test whether the desired state already exists;
-#   - if yes, print that it is already satisfied and skip the mutation;
+#   - if yes, report the step as `déjà fait` and skip the mutation;
 #   - if no, perform the mutation;
 #   - immediately verify the resulting state with an independent check;
 #   - fail with a precise error if the postcondition is not true.
@@ -167,6 +167,21 @@ set -euo pipefail
 #   - small single-purpose functions;
 #   - full OWNER/REPO names and deterministic paths over implicit inference.
 # Do not rely on `set -e` as a substitute for validation.
+#
+# OUTPUT POLICY
+# -------------
+# Normal successful output MUST stay minimal. For a step that is executed, print
+# only one action prefix and its final result on the same line, for example:
+#     ==> Installation de git, gh et fish... OK
+# For an idempotent step that is already satisfied, print only:
+#     ==> git, gh et fish... déjà fait
+# Do not print environment reports, versions, verification chatter, package-
+# manager progress, download progress or successful command output. External
+# command stdout/stderr MUST be captured; reveal it only when that command fails,
+# immediately before the fatal ERROR line. The sole intentional interactive
+# exception is `gh auth login --web` when GitHub authentication is not already
+# valid; its browser instructions/device code must remain visible. A sudo password
+# prompt may also remain visible when privilege escalation is genuinely required.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -179,15 +194,55 @@ die() {
 }
 
 info() {
-    printf '==> %s\n' "$*"
+    printf '==> %s... ' "$*"
+}
+
+interactive_info() {
+    printf '==> %s...\n' "$*"
 }
 
 ok() {
-    printf ' OK  %s\n' "$*"
+    printf 'OK\n'
 }
 
 already() {
-    printf ' --  %s (déjà fait)\n' "$*"
+    printf '==> %s... déjà fait\n' "$*"
+}
+
+run_quiet() {
+    local log_file
+    local status
+
+    log_file="$(mktemp)" || die "mktemp a échoué pour capturer une commande"
+    if "$@" >"$log_file" 2>&1; then
+        rm -f "$log_file" || die "suppression du journal temporaire impossible"
+        return 0
+    else
+        status=$?
+    fi
+
+    if [[ -s "$log_file" ]]; then
+        cat "$log_file" >&2 || true
+    fi
+    rm -f "$log_file" || true
+    return "$status"
+}
+
+ensure_sudo_ready() {
+    require_cmd sudo
+
+    if sudo -n true >/dev/null 2>&1; then
+        return 0
+    fi
+
+    sudo -v || die "sudo n'a pas pu être validé"
+    sudo -n true >/dev/null 2>&1 ||
+        die "sudo reste indisponible après authentification"
+}
+
+run_root_quiet() {
+    ensure_sudo_ready
+    run_quiet sudo -n "$@"
 }
 
 require_cmd() {
@@ -234,8 +289,8 @@ first_nonempty_line() {
 }
 
 as_root() {
-    require_cmd sudo
-    sudo "$@"
+    ensure_sudo_ready
+    sudo -n "$@"
 }
 
 # -----------------------------------------------------------------------------
@@ -256,6 +311,8 @@ require_cmd grep
 require_cmd mktemp
 require_cmd rm
 require_cmd touch
+require_cmd cat
+require_cmd env
 
 readonly EXPECTED_GITHUB_LOGIN="panlelapin"
 readonly PRIVATE_REPO="panlelapin/setup2"
@@ -499,15 +556,14 @@ ensure_macos_sudo_for_homebrew() {
     require_exec /usr/bin/sudo
 
     if /usr/bin/sudo -n true >/dev/null 2>&1; then
-        already "accès sudo nécessaire à Homebrew"
         return
     fi
 
-    info "Validation sudo pour l'installation Homebrew"
+    interactive_info "Validation sudo"
     /usr/bin/sudo -v || die "sudo n'a pas pu être validé"
     /usr/bin/sudo -n true >/dev/null 2>&1 ||
         die "Homebrew nécessite un accès sudo administrateur sur macOS"
-    ok "sudo validé"
+    ok
 }
 
 verify_dnf() {
@@ -516,7 +572,6 @@ verify_dnf() {
     require_cmd dnf
     dnf_output="$(dnf --version)" || die "DNF inutilisable"
     assert_nonempty "$dnf_output" "version DNF"
-    ok "DNF vérifié: $(first_line "$dnf_output")"
 }
 
 fedora_bootstrap_ready() {
@@ -530,28 +585,25 @@ fedora_bootstrap_ready() {
 
 ensure_fedora_homebrew_prereqs() {
     if fedora_bootstrap_ready; then
-        already "prérequis Homebrew Fedora"
+        already "Prérequis Homebrew Fedora"
         return
     fi
 
-    info "Installation des outils de développement Homebrew via DNF"
-    as_root dnf group install -y development-tools ||
+    info "Installation des prérequis Homebrew Fedora"
+    run_root_quiet dnf group install -y development-tools ||
         die "échec de l'installation du groupe development-tools"
+    run_root_quiet dnf install -y procps-ng curl file git ||
+        die "échec de l'installation des utilitaires Homebrew"
+
     require_cmd cc
     require_cmd make
-    ok "outils de développement DNF vérifiés"
-
-    info "Installation des utilitaires Homebrew via DNF"
-    as_root dnf install -y procps-ng curl file git ||
-        die "échec de l'installation des utilitaires Homebrew"
     require_cmd ps
     require_cmd curl
     require_cmd file
     require_cmd git
-    ok "utilitaires Homebrew DNF vérifiés"
-
     fedora_bootstrap_ready ||
         die "les prérequis Homebrew Fedora restent incomplets après DNF"
+    ok
 }
 
 install_homebrew() {
@@ -561,26 +613,24 @@ install_homebrew() {
     require_exec /bin/bash
     tmp_file="$(mktemp)" || die "mktemp a échoué"
 
-    info "Téléchargement de l'installateur Homebrew"
+    info "Installation de Homebrew dans $brew_prefix"
     curl -fsSL "$HOMEBREW_INSTALL_URL" -o "$tmp_file" ||
         die "téléchargement de l'installateur Homebrew impossible"
     [[ -s "$tmp_file" ]] || die "installateur Homebrew téléchargé vide"
-    ok "installateur Homebrew téléchargé et non vide"
 
     if [[ "$family" == "macos" ]]; then
         ensure_macos_sudo_for_homebrew
     fi
 
-    info "Installation de Homebrew dans $brew_prefix"
     if [[ "$family" == "macos" && "$cpu" == "arm64" &&
           "$process_cpu" == "x86_64" ]]; then
         require_exec /usr/bin/arch
         installer_arch="arm64"
-        NONINTERACTIVE=1 /usr/bin/arch -arm64 /bin/bash "$tmp_file" ||
+        run_quiet env NONINTERACTIVE=1 /usr/bin/arch -arm64 /bin/bash "$tmp_file" ||
             die "installation Homebrew native ARM64 échouée sous Rosetta"
     else
         installer_arch="$process_cpu"
-        NONINTERACTIVE=1 /bin/bash "$tmp_file" ||
+        run_quiet env NONINTERACTIVE=1 /bin/bash "$tmp_file" ||
             die "installation Homebrew échouée"
     fi
 
@@ -589,7 +639,7 @@ install_homebrew() {
 
     brew_exists || die "Homebrew absent du préfixe attendu après installation: $brew_bin"
     verify_brew
-    ok "Homebrew installé et vérifié ($installer_arch, $brew_prefix)"
+    ok
 }
 
 ensure_homebrew() {
@@ -606,10 +656,6 @@ ensure_homebrew() {
         return
     fi
 
-    if command -v brew >/dev/null 2>&1; then
-        info "Un autre brew est présent mais il n'est pas au préfixe supporté; il sera ignoré"
-    fi
-
     case "$family" in
         macos)
             install_homebrew
@@ -624,7 +670,6 @@ ensure_homebrew() {
     esac
 
     activate_brew
-    ok "Homebrew actif avec bin/sbin en tête de PATH"
 }
 
 # -----------------------------------------------------------------------------
@@ -640,16 +685,15 @@ ensure_brew_formula_binary() {
     local binary="$2"
 
     if [[ -x "$binary" ]]; then
-        already "binaire Homebrew $binary"
         return
     fi
 
-    info "Lien Homebrew manquant pour $formula; tentative de brew link"
-    brew_run link "$formula" ||
+    info "Lien Homebrew $formula"
+    run_quiet brew_run link "$formula" ||
         die "formule $formula installée mais impossible à lier dans $brew_prefix"
     [[ -x "$binary" ]] ||
         die "binaire $binary absent après brew link $formula"
-    ok "binaire Homebrew $binary lié et vérifié"
+    ok
 }
 
 install_brew_tools() {
@@ -658,24 +702,24 @@ install_brew_tools() {
 
     missing=()
     for formula in git gh fish; do
-        if brew_formula_installed "$formula"; then
-            already "formule Homebrew $formula"
-        else
-            missing+=("$formula")
-        fi
+        brew_formula_installed "$formula" || missing+=("$formula")
     done
 
-    if (( ${#missing[@]} > 0 )); then
+    if (( ${#missing[@]} == 0 )); then
+        already "git, gh et fish via Homebrew"
+    else
         info "Installation Homebrew: ${missing[*]}"
-        HOMEBREW_NO_ASK=1 brew_run install -y "${missing[@]}" ||
-            die "brew install a échoué"
-    fi
+        (
+            export HOMEBREW_NO_ASK=1
+            run_quiet brew_run install -y "${missing[@]}"
+        ) || die "brew install a échoué"
 
-    for formula in git gh fish; do
-        brew_formula_installed "$formula" ||
-            die "formule Homebrew absente après installation: $formula"
-    done
-    ok "formules Homebrew git, gh et fish vérifiées"
+        for formula in git gh fish; do
+            brew_formula_installed "$formula" ||
+                die "formule Homebrew absente après installation: $formula"
+        done
+        ok
+    fi
 
     activate_brew
     git_bin="${brew_prefix}/bin/git"
@@ -713,27 +757,21 @@ ensure_debian_download_prereqs() {
 
     missing=()
     for package in curl ca-certificates; do
-        if deb_package_installed "$package"; then
-            already "paquet APT $package"
-        else
-            missing+=("$package")
-        fi
+        deb_package_installed "$package" || missing+=("$package")
     done
 
     if (( ${#missing[@]} == 0 )); then
         require_cmd curl
+        already "Prérequis de téléchargement APT"
         return
     fi
 
-    info "Mise à jour de l'index APT pour les prérequis de téléchargement"
-    as_root apt-get update || die "apt-get update a échoué"
+    info "Installation APT: ${missing[*]}"
+    run_root_quiet apt-get update || die "apt-get update a échoué"
     for package in "${missing[@]}"; do
         verify_apt_candidate "$package"
     done
-    ok "index APT vérifié pour les prérequis"
-
-    info "Installation APT: ${missing[*]}"
-    as_root apt-get install -y "${missing[@]}" ||
+    run_root_quiet apt-get install -y "${missing[@]}" ||
         die "installation des prérequis APT échouée"
 
     for package in "${missing[@]}"; do
@@ -741,7 +779,7 @@ ensure_debian_download_prereqs() {
             die "paquet APT absent après installation: $package"
     done
     require_cmd curl
-    ok "prérequis de téléchargement APT vérifiés"
+    ok
 }
 
 expected_debian_arch() {
@@ -809,8 +847,8 @@ configure_github_cli_apt_repo() {
     require_cmd curl
     require_cmd install
 
-    info "Configuration du keyring officiel GitHub CLI"
-    as_root install -d -m 0755 /etc/apt/keyrings ||
+    info "Configuration du dépôt APT officiel GitHub CLI"
+    run_root_quiet install -d -m 0755 /etc/apt/keyrings ||
         die "création de /etc/apt/keyrings impossible"
     [[ -d /etc/apt/keyrings ]] || die "/etc/apt/keyrings absent après création"
 
@@ -820,25 +858,23 @@ configure_github_cli_apt_repo() {
     [[ -s "$tmp_file" ]] || die "keyring GitHub CLI téléchargé vide"
     assert_eq "$(file_sha256 "$tmp_file")" "$GH_APT_KEY_SHA256" \
         "SHA-256 du keyring GitHub CLI téléchargé"
-    ok "keyring GitHub CLI téléchargé et empreinte SHA-256 vérifiée"
 
-    as_root install -m 0644 "$tmp_file" "$GH_APT_KEYRING" ||
+    run_root_quiet install -m 0644 "$tmp_file" "$GH_APT_KEYRING" ||
         die "installation du keyring GitHub CLI impossible"
     gh_apt_keyring_valid ||
         die "keyring GitHub CLI invalide après installation"
-    ok "keyring GitHub CLI installé et vérifié"
 
     printf '%s\n' "$expected_source" > "$tmp_file" ||
         die "création du fichier source GitHub CLI temporaire impossible"
     grep -Fqx "$expected_source" "$tmp_file" ||
         die "source GitHub CLI temporaire invalide"
 
-    as_root install -d -m 0755 /etc/apt/sources.list.d ||
+    run_root_quiet install -d -m 0755 /etc/apt/sources.list.d ||
         die "création de /etc/apt/sources.list.d impossible"
     [[ -d /etc/apt/sources.list.d ]] ||
         die "/etc/apt/sources.list.d absent après création"
 
-    as_root install -m 0644 "$tmp_file" "$GH_APT_SOURCE" ||
+    run_root_quiet install -m 0644 "$tmp_file" "$GH_APT_SOURCE" ||
         die "installation de la source APT GitHub CLI impossible"
     gh_apt_repo_configured "$expected_source" ||
         die "dépôt APT GitHub CLI invalide après configuration"
@@ -846,7 +882,7 @@ configure_github_cli_apt_repo() {
     rm -f "$tmp_file" || die "suppression du fichier temporaire APT impossible"
     tmp_file=""
     gh_apt_repo_changed="true"
-    ok "dépôt APT officiel GitHub CLI configuré et vérifié"
+    ok
     return 0
 }
 
@@ -884,30 +920,24 @@ install_debian_tools() {
 
     missing=()
     for package in git fish; do
-        if deb_package_installed "$package"; then
-            already "paquet APT $package"
-        else
-            missing+=("$package")
-        fi
+        deb_package_installed "$package" || missing+=("$package")
     done
 
-    if official_gh_deb_installed && [[ "$gh_apt_repo_changed" == "false" ]]; then
-        already "paquet APT officiel GitHub CLI gh"
-    else
+    if ! official_gh_deb_installed || [[ "$gh_apt_repo_changed" == "true" ]]; then
         missing+=("gh")
     fi
 
-    if (( ${#missing[@]} > 0 )); then
-        info "Mise à jour de l'index APT"
-        as_root apt-get update || die "apt-get update a échoué"
+    if (( ${#missing[@]} == 0 )); then
+        already "git, gh et fish via APT"
+    else
+        info "Installation APT: ${missing[*]}"
+        run_root_quiet apt-get update || die "apt-get update a échoué"
         for package in git gh fish; do
             verify_apt_candidate "$package"
         done
-        ok "candidats APT git, gh et fish vérifiés"
-
-        info "Installation APT: ${missing[*]}"
-        as_root apt-get install -y "${missing[@]}" ||
+        run_root_quiet apt-get install -y "${missing[@]}" ||
             die "installation APT de git/gh/fish échouée"
+        ok
     fi
 
     for package in git gh fish; do
@@ -924,7 +954,6 @@ install_debian_tools() {
     git_bin="/usr/bin/git"
     gh_bin="/usr/bin/gh"
     fish_bin="/usr/bin/fish"
-    ok "git, gh et fish APT vérifiés"
 }
 
 termux_package_installed() {
@@ -1006,18 +1035,15 @@ install_termux_tools() {
     fi
 
     if termux_tools_present; then
-        already "paquets Termux git, gh et fish"
+        already "git, gh et fish via Termux"
     else
-        info "Mise à jour des paquets Termux"
-        pkg update -y || die "pkg update a échoué"
-        verify_termux_candidates
-        ok "index Termux mis à jour; candidats git, gh et fish vérifiés"
-
         info "Installation Termux: git gh fish"
-        pkg install -y git gh fish || die "pkg install git gh fish a échoué"
+        run_quiet pkg update -y || die "pkg update a échoué"
+        verify_termux_candidates
+        run_quiet pkg install -y git gh fish || die "pkg install git gh fish a échoué"
         termux_tools_present ||
             die "git/gh/fish manquent après pkg install"
-        ok "paquets Termux git, gh et fish installés et vérifiés"
+        ok
     fi
 
     git_bin="${PREFIX}/bin/git"
@@ -1059,37 +1085,46 @@ brew_shellenv_invocation() {
     fi
 }
 
+exact_line_present() {
+    local rc_file="$1"
+    local line="$2"
+    local grep_status
+
+    [[ -f "$rc_file" ]] || return 1
+
+    if grep -Fqx "$line" "$rc_file" 2>/dev/null; then
+        return 0
+    fi
+
+    grep_status=$?
+    [[ "$grep_status" -eq 1 ]] ||
+        die "impossible de lire $rc_file"
+    return 1
+}
+
 ensure_exact_line() {
     local rc_file="$1"
     local line="$2"
     local label="$3"
-    local grep_status
 
     if [[ -e "$rc_file" && ! -f "$rc_file" ]]; then
         die "$rc_file existe mais n'est pas un fichier régulier"
     fi
 
-    if [[ -f "$rc_file" ]]; then
-        if grep -Fqx "$line" "$rc_file" 2>/dev/null; then
-            already "$label dans $rc_file"
-            return
-        else
-            grep_status=$?
-            [[ "$grep_status" -eq 1 ]] ||
-                die "impossible de lire $rc_file pour vérifier $label"
-        fi
-    else
+    if exact_line_present "$rc_file" "$line"; then
+        return 0
+    fi
+
+    if [[ ! -f "$rc_file" ]]; then
         touch "$rc_file" || die "impossible de créer $rc_file"
         [[ -f "$rc_file" ]] || die "$rc_file n'a pas été créé"
-        ok "fichier créé: $rc_file"
     fi
 
     [[ -w "$rc_file" ]] || die "$rc_file n'est pas inscriptible"
     printf '\n%s\n' "$line" >> "$rc_file" ||
         die "impossible d'ajouter $label à $rc_file"
-    grep -Fqx "$line" "$rc_file" ||
+    exact_line_present "$rc_file" "$line" ||
         die "$label absent de $rc_file après écriture"
-    ok "$label ajouté et vérifié dans $rc_file"
 }
 
 verify_shellenv_effect() {
@@ -1151,7 +1186,6 @@ verify_shellenv_effect() {
     done <<< "$raw_output"
 
     assert_eq "$result" "$brew_bin" "brew shellenv $shell_kind dans un shell propre"
-    ok "brew shellenv $shell_kind testé dans un shell propre"
 }
 
 configure_bash_brew_path() {
@@ -1162,7 +1196,6 @@ configure_bash_brew_path() {
 
     bash_path="$(command -v bash 2>/dev/null || true)"
     if [[ -z "$bash_path" ]]; then
-        info "Bash absent: configuration PATH Bash ignorée"
         return
     fi
 
@@ -1174,12 +1207,19 @@ configure_bash_brew_path() {
         login_rc="$HOME/.profile"
     fi
 
-    brew_run shellenv bash >/dev/null || die "brew shellenv bash non supporté"
+    run_quiet brew_run shellenv bash || die "brew shellenv bash non supporté"
     invocation="$(brew_shellenv_invocation bash)"
     line="eval \"\$(${invocation})\""
 
-    ensure_exact_line "$login_rc" "$line" "brew shellenv bash (login)"
-    ensure_exact_line "$HOME/.bashrc" "$line" "brew shellenv bash (interactif)"
+    if exact_line_present "$login_rc" "$line" &&
+       exact_line_present "$HOME/.bashrc" "$line"; then
+        already "PATH Homebrew Bash"
+    else
+        info "Configuration PATH Homebrew Bash"
+        ensure_exact_line "$login_rc" "$line" "brew shellenv bash (login)"
+        ensure_exact_line "$HOME/.bashrc" "$line" "brew shellenv bash (interactif)"
+        ok
+    fi
     verify_shellenv_effect bash "$bash_path"
 }
 
@@ -1190,16 +1230,22 @@ configure_zsh_brew_path() {
 
     zsh_path="$(command -v zsh 2>/dev/null || true)"
     if [[ -z "$zsh_path" ]]; then
-        info "Zsh absent: configuration PATH Zsh ignorée"
         return
     fi
 
-    brew_run shellenv zsh >/dev/null || die "brew shellenv zsh non supporté"
+    run_quiet brew_run shellenv zsh || die "brew shellenv zsh non supporté"
     invocation="$(brew_shellenv_invocation zsh)"
     line="eval \"\$(${invocation})\""
 
-    ensure_exact_line "$HOME/.zprofile" "$line" "brew shellenv zsh (login)"
-    ensure_exact_line "$HOME/.zshrc" "$line" "brew shellenv zsh (interactif)"
+    if exact_line_present "$HOME/.zprofile" "$line" &&
+       exact_line_present "$HOME/.zshrc" "$line"; then
+        already "PATH Homebrew Zsh"
+    else
+        info "Configuration PATH Homebrew Zsh"
+        ensure_exact_line "$HOME/.zprofile" "$line" "brew shellenv zsh (login)"
+        ensure_exact_line "$HOME/.zshrc" "$line" "brew shellenv zsh (interactif)"
+        ok
+    fi
     verify_shellenv_effect zsh "$zsh_path"
 }
 
@@ -1210,7 +1256,7 @@ configure_fish_brew_path() {
     local invocation
     local line
 
-    brew_run shellenv fish >/dev/null || die "brew shellenv fish non supporté"
+    run_quiet brew_run shellenv fish || die "brew shellenv fish non supporté"
     [[ -x "$fish_bin" ]] || die "Fish Homebrew attendu mais absent: $fish_bin"
 
     if [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
@@ -1233,12 +1279,15 @@ configure_fish_brew_path() {
     if [[ ! -d "$fish_dir" ]]; then
         mkdir -p "$fish_dir" || die "création de $fish_dir impossible"
         [[ -d "$fish_dir" ]] || die "$fish_dir absent après mkdir"
-        ok "dossier Fish créé: $fish_dir"
-    else
-        already "dossier Fish $fish_dir"
     fi
 
-    ensure_exact_line "$rc_file" "$line" "brew shellenv fish"
+    if exact_line_present "$rc_file" "$line"; then
+        already "PATH Homebrew Fish"
+    else
+        info "Configuration PATH Homebrew Fish"
+        ensure_exact_line "$rc_file" "$line" "brew shellenv fish"
+        ok
+    fi
     verify_shellenv_effect fish "$fish_bin"
 }
 
@@ -1249,7 +1298,6 @@ persist_brew_path() {
             configure_zsh_brew_path
             configure_fish_brew_path
             activate_brew
-            ok "PATH Homebrew courant et persistant vérifié"
             ;;
     esac
 }
@@ -1275,19 +1323,6 @@ verify_core_tools() {
     assert_nonempty "$gh_version" "version gh"
     assert_nonempty "$fish_version" "version Fish"
 
-    printf '\nDetected environment\n'
-    printf '  distro : %s\n' "$distro"
-    printf '  family : %s\n' "$family"
-    printf '  cpu    : %s\n' "$cpu"
-    printf '  pkgmgr : %s\n' "$pkgmgr"
-    printf '  version: %s\n' "$pkgver"
-    if [[ -n "$brew_prefix" ]]; then
-        printf '  brew   : %s\n' "$brew_prefix"
-        printf '  PATH[0]: %s\n' "${PATH%%:*}"
-    fi
-    printf '  git    : %s\n' "$(first_line "$git_version")"
-    printf '  gh     : %s\n' "$(first_line "$gh_version")"
-    printf '  fish   : %s\n\n' "$(first_line "$fish_version")"
 }
 
 # -----------------------------------------------------------------------------
@@ -1308,16 +1343,13 @@ ensure_github_auth() {
     local helper_output
     local helper_needle
 
-    info "Vérification de l'authentification GitHub"
-    if gh_run auth status --hostname github.com >/dev/null 2>&1; then
-        already "authentification GitHub github.com"
-    else
-        info "Authentification GitHub via navigateur"
+    if ! gh_run auth status --hostname github.com >/dev/null 2>&1; then
+        interactive_info "Authentification GitHub via navigateur"
         gh_run auth login --hostname github.com --web --git-protocol https ||
             die "gh auth login a échoué"
         gh_run auth status --hostname github.com >/dev/null 2>&1 ||
             die "GitHub n'est pas authentifié après gh auth login"
-        ok "authentification GitHub vérifiée"
+        ok
     fi
 
     actual_login="$(gh_run api user --jq '.login')" ||
@@ -1331,34 +1363,35 @@ ensure_github_auth() {
         fi
         die "compte GitHub actif '$actual_login' au lieu de '$EXPECTED_GITHUB_LOGIN'"
     fi
-    ok "compte GitHub actif vérifié: $actual_login"
 
     protocol="$(gh_run config get git_protocol --host github.com 2>/dev/null || true)"
-    if [[ "$protocol" == "https" ]]; then
-        already "protocole GitHub CLI HTTPS"
-    else
-        info "Configuration de GitHub CLI pour Git HTTPS"
-        gh_run config set git_protocol https --host github.com ||
-            die "impossible de configurer git_protocol=https"
-        protocol="$(gh_run config get git_protocol --host github.com)" ||
-            die "impossible de relire git_protocol"
-        assert_eq "$protocol" "https" "protocole GitHub CLI"
-        ok "protocole GitHub CLI HTTPS vérifié"
-    fi
-
     helper_needle="!${gh_bin} auth git-credential"
     helper_output="$("$git_bin" config --global --get-all credential.https://github.com.helper 2>/dev/null || true)"
-    if [[ "$helper_output" == $'\n'"$helper_needle" ]]; then
-        already "credential helper GitHub CLI pour Git"
+
+    if [[ "$protocol" == "https" && "$helper_output" == $'\n'"$helper_needle" ]]; then
+        already "Configuration GitHub CLI"
     else
-        info "Configuration du credential helper GitHub CLI"
-        gh_run auth setup-git --hostname github.com --force ||
-            die "gh auth setup-git a échoué"
+        info "Configuration GitHub CLI"
+
+        if [[ "$protocol" != "https" ]]; then
+            run_quiet gh_run config set git_protocol https --host github.com ||
+                die "impossible de configurer git_protocol=https"
+        fi
+
+        helper_output="$("$git_bin" config --global --get-all credential.https://github.com.helper 2>/dev/null || true)"
+        if [[ "$helper_output" != $'\n'"$helper_needle" ]]; then
+            run_quiet gh_run auth setup-git --hostname github.com --force ||
+                die "gh auth setup-git a échoué"
+        fi
+
+        protocol="$(gh_run config get git_protocol --host github.com 2>/dev/null || true)"
+        assert_eq "$protocol" "https" "protocole GitHub CLI"
         helper_output="$("$git_bin" config --global --get-all credential.https://github.com.helper 2>/dev/null || true)"
         [[ "$helper_output" == $'\n'"$helper_needle" ]] ||
-            die "credential helper GitHub CLI incorrect après gh auth setup-git"
-        ok "credential helper GitHub CLI vérifié"
+            die "credential helper GitHub CLI incorrect après configuration"
+        ok
     fi
+
 }
 
 ensure_git_identity() {
@@ -1367,8 +1400,7 @@ ensure_git_identity() {
     local git_id
     local git_email
     local current
-
-    info "Vérification de l'identité Git"
+    local current_email
 
     git_name="$(gh_run api user --jq 'if (.name // "") == "" then .login else .name end')" ||
         die "impossible de lire le nom du profil GitHub"
@@ -1384,26 +1416,29 @@ ensure_git_identity() {
     git_email="${git_id}+${git_login}@users.noreply.github.com"
 
     current="$("$git_bin" config --global --get user.name 2>/dev/null || true)"
-    if [[ "$current" == "$git_name" ]]; then
-        already "git user.name = $git_name"
+    current_email="$("$git_bin" config --global --get user.email 2>/dev/null || true)"
+
+    if [[ "$current" == "$git_name" && "$current_email" == "$git_email" ]]; then
+        already "Identité Git"
     else
-        "$git_bin" config --global user.name "$git_name" ||
-            die "impossible de configurer git user.name"
+        info "Configuration de l'identité Git"
+
+        if [[ "$current" != "$git_name" ]]; then
+            run_quiet "$git_bin" config --global user.name "$git_name" ||
+                die "impossible de configurer git user.name"
+        fi
+        if [[ "$current_email" != "$git_email" ]]; then
+            run_quiet "$git_bin" config --global user.email "$git_email" ||
+                die "impossible de configurer git user.email"
+        fi
+
         current="$("$git_bin" config --global --get user.name 2>/dev/null || true)"
+        current_email="$("$git_bin" config --global --get user.email 2>/dev/null || true)"
         assert_eq "$current" "$git_name" "git user.name"
-        ok "git user.name configuré et vérifié"
+        assert_eq "$current_email" "$git_email" "git user.email"
+        ok
     fi
 
-    current="$("$git_bin" config --global --get user.email 2>/dev/null || true)"
-    if [[ "$current" == "$git_email" ]]; then
-        already "git user.email = $git_email"
-    else
-        "$git_bin" config --global user.email "$git_email" ||
-            die "impossible de configurer git user.email"
-        current="$("$git_bin" config --global --get user.email 2>/dev/null || true)"
-        assert_eq "$current" "$git_email" "git user.email"
-        ok "git user.email configuré et vérifié"
-    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -1415,7 +1450,6 @@ verify_private_repo_remote() {
     local repo_name
     local is_private
 
-    info "Vérification du dépôt privé $PRIVATE_REPO"
     repo_info="$(
         gh_run repo view "$PRIVATE_REPO" \
             --json nameWithOwner,isPrivate \
@@ -1426,7 +1460,6 @@ verify_private_repo_remote() {
     IFS=$'\t' read -r repo_name is_private <<< "$repo_info"
     assert_eq "$repo_name" "$PRIVATE_REPO" "nom du dépôt privé"
     assert_eq "$is_private" "true" "visibilité privée de $PRIVATE_REPO"
-    ok "dépôt $PRIVATE_REPO accessible et privé"
 }
 
 ensure_project_parent() {
@@ -1434,12 +1467,9 @@ ensure_project_parent() {
         die "$PDIR existe mais n'est pas un dossier"
     fi
 
-    if [[ -d "$PDIR" ]]; then
-        already "dossier $PDIR"
-    else
+    if [[ ! -d "$PDIR" ]]; then
         mkdir -p "$PDIR" || die "création de $PDIR impossible"
         [[ -d "$PDIR" ]] || die "$PDIR absent après mkdir"
-        ok "dossier $PDIR créé et vérifié"
     fi
 
     [[ -w "$PDIR" ]] || die "$PDIR n'est pas inscriptible"
@@ -1470,16 +1500,16 @@ ensure_setup2_checkout() {
 
     if [[ ! -e "$SETUP_DIR" ]]; then
         info "Clone de $PRIVATE_REPO vers $SETUP_DIR"
-        gh_run repo clone "$PRIVATE_REPO_HTTPS" "$SETUP_DIR" ||
+        run_quiet gh_run repo clone "$PRIVATE_REPO_HTTPS" "$SETUP_DIR" ||
             die "clone de $PRIVATE_REPO échoué"
         [[ -d "$SETUP_DIR" ]] || die "$SETUP_DIR absent après clone"
-        ok "dépôt setup2 cloné"
+        ok
     else
         [[ -d "$SETUP_DIR" ]] ||
             die "$SETUP_DIR existe mais n'est pas un dossier"
         inside="$("$git_bin" -C "$SETUP_DIR" rev-parse --is-inside-work-tree 2>/dev/null || true)"
         assert_eq "$inside" "true" "$SETUP_DIR doit être un dépôt Git"
-        already "checkout Git $SETUP_DIR"
+        already "Checkout setup2"
     fi
 
     origin="$("$git_bin" -C "$SETUP_DIR" remote get-url origin 2>/dev/null || true)"
@@ -1488,16 +1518,14 @@ ensure_setup2_checkout() {
     origin_points_to_expected_repo "$origin" ||
         die "$SETUP_DIR existe déjà mais origin pointe vers un autre dépôt: $origin"
 
-    if [[ "$origin" == "$PRIVATE_REPO_HTTPS" ]]; then
-        already "origin setup2 = $origin"
-    else
+    if [[ "$origin" != "$PRIVATE_REPO_HTTPS" ]]; then
         info "Normalisation de l'origin setup2 existant vers HTTPS"
-        "$git_bin" -C "$SETUP_DIR" remote set-url origin "$PRIVATE_REPO_HTTPS" ||
+        run_quiet "$git_bin" -C "$SETUP_DIR" remote set-url origin "$PRIVATE_REPO_HTTPS" ||
             die "impossible de normaliser origin de setup2"
         origin="$("$git_bin" -C "$SETUP_DIR" remote get-url origin)" ||
             die "impossible de relire origin de setup2"
         assert_eq "$origin" "$PRIVATE_REPO_HTTPS" "origin setup2"
-        ok "origin setup2 normalisé et vérifié"
+        ok
     fi
 
     [[ -f "$SETUP_SCRIPT" ]] || die "script privé introuvable: $SETUP_SCRIPT"
@@ -1505,13 +1533,12 @@ ensure_setup2_checkout() {
     "$git_bin" -C "$SETUP_DIR" ls-files --error-unmatch setup2.sh >/dev/null 2>&1 ||
         die "setup2.sh existe mais n'est pas suivi par Git dans $PRIVATE_REPO"
     "$BASH" -n "$SETUP_SCRIPT" || die "syntaxe Bash invalide dans $SETUP_SCRIPT"
-    ok "setup2.sh présent, suivi par Git, lisible et syntaxiquement valide"
 }
 
 run_setup2() {
     info "Passage au setup privé"
     if "$BASH" "$SETUP_SCRIPT"; then
-        ok "setup2.sh terminé avec succès"
+        ok
     else
         die "setup2.sh a échoué"
     fi
@@ -1523,8 +1550,6 @@ run_setup2() {
 
 main() {
     detect_environment
-    ok "environnement détecté: distro=$distro family=$family cpu=$cpu"
-
     case "$family" in
         macos|fedora|fedora-atomic)
             ensure_homebrew
