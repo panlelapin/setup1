@@ -23,6 +23,38 @@ set -euo pipefail
 # If this repository has no AGENTS.md, an LLM modifying this file MUST preserve
 # the rules below unless the user explicitly changes them.
 #
+# HOW TO RUN
+# ----------
+# Preferred when the file is already present:
+#   bash setup1.sh
+#
+# The public raw source is:
+#   https://raw.githubusercontent.com/panlelapin/setup1/master/setup1.sh
+# When bootstrapping from the network, download successfully first, verify that
+# the downloaded file is non-empty, then invoke it with Bash. Do not rely on a
+# `curl | bash` pipeline as the implementation's only download-success check.
+#
+# HOW TO EXTEND THIS SCRIPT
+# -------------------------
+# When adding a new bootstrap responsibility or CLI tool, follow this order:
+#   1. document the desired state and per-platform ownership in this contract;
+#   2. validate every command/file/environment value before first use;
+#   3. detect whether the desired state is already satisfied;
+#   4. print `(déjà fait)` and skip mutation when it is already satisfied;
+#   5. otherwise perform the smallest necessary mutation;
+#   6. immediately verify the mutation using an independent state query;
+#   7. verify the executable actually selected by PATH, not just its package;
+#   8. never repair/overwrite unrelated user state merely to make the run pass;
+#   9. keep repeat runs convergent: no duplicate lines, clones, repos or config.
+#
+# Upstream behavior that matters to this bootstrap should be checked against
+# current official documentation before changing commands or assumptions:
+#   - https://docs.brew.sh/Installation
+#   - https://docs.brew.sh/Homebrew-on-Linux
+#   - https://docs.brew.sh/Manpage
+#   - https://github.com/cli/cli/blob/trunk/docs/install_linux.md
+#   - https://cli.github.com/manual/
+#
 # SUPPORTED PLATFORMS
 # -------------------
 # CPU architectures:
@@ -73,8 +105,11 @@ set -euo pipefail
 #   - HOMEBREW_PREFIX/sbin MUST be PATH entry 2.
 #   - use `brew shellenv <shell>` with the shell name explicitly supplied;
 #   - persist shellenv only for shells that are actually installed;
-#   - macOS: Bash -> ~/.bash_profile, Zsh -> ~/.zprofile, Fish -> config.fish;
-#   - Linux: Bash -> ~/.bashrc, Zsh -> ~/.zshrc, Fish -> config.fish;
+#   - Bash: configure ~/.bashrc plus the existing login startup file selected by
+#     Bash precedence (.bash_profile, .bash_login, otherwise .profile);
+#   - Zsh: configure ~/.zprofile and ~/.zshrc;
+#   - Fish: honor XDG_CONFIG_HOME when set, otherwise use ~/.config/fish;
+#   - on Apple Silicon, persisted Homebrew calls force native ARM64 execution;
 #   - never append duplicate configuration lines.
 #
 # GITHUB / GIT POLICY
@@ -230,6 +265,7 @@ readonly SETUP_DIR="${PDIR}/setup2"
 readonly SETUP_SCRIPT="${SETUP_DIR}/setup2.sh"
 readonly HOMEBREW_INSTALL_URL="https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
 readonly GH_APT_KEY_URL="https://cli.github.com/packages/githubcli-archive-keyring.gpg"
+readonly GH_APT_KEY_SHA256="6084d5d7bd8e288441e0e94fc6275570895da18e6751f70f057485dc2d1a811b"
 readonly GH_APT_KEYRING="/etc/apt/keyrings/githubcli-archive-keyring.gpg"
 readonly GH_APT_SOURCE="/etc/apt/sources.list.d/github-cli.list"
 
@@ -462,16 +498,25 @@ activate_brew() {
 ensure_macos_sudo_for_homebrew() {
     require_exec /usr/bin/sudo
 
-    if /usr/bin/sudo -n -l mkdir >/dev/null 2>&1; then
+    if /usr/bin/sudo -n true >/dev/null 2>&1; then
         already "accès sudo nécessaire à Homebrew"
         return
     fi
 
     info "Validation sudo pour l'installation Homebrew"
     /usr/bin/sudo -v || die "sudo n'a pas pu être validé"
-    /usr/bin/sudo -n -l mkdir >/dev/null 2>&1 ||
+    /usr/bin/sudo -n true >/dev/null 2>&1 ||
         die "Homebrew nécessite un accès sudo administrateur sur macOS"
     ok "sudo validé"
+}
+
+verify_dnf() {
+    local dnf_output
+
+    require_cmd dnf
+    dnf_output="$(dnf --version)" || die "DNF inutilisable"
+    assert_nonempty "$dnf_output" "version DNF"
+    ok "DNF vérifié: $(first_line "$dnf_output")"
 }
 
 fedora_bootstrap_ready() {
@@ -484,12 +529,6 @@ fedora_bootstrap_ready() {
 }
 
 ensure_fedora_homebrew_prereqs() {
-    local dnf_output
-
-    require_cmd dnf
-    dnf_output="$(dnf --version)" || die "DNF inutilisable"
-    assert_nonempty "$dnf_output" "version DNF"
-
     if fedora_bootstrap_ready; then
         already "prérequis Homebrew Fedora"
         return
@@ -556,6 +595,10 @@ install_homebrew() {
 ensure_homebrew() {
     set_expected_brew
 
+    if [[ "$family" == "fedora" ]]; then
+        verify_dnf
+    fi
+
     if brew_exists; then
         verify_brew
         already "Homebrew $pkgver dans $brew_prefix"
@@ -592,6 +635,23 @@ brew_formula_installed() {
     brew_run list --formula --versions "$1" >/dev/null 2>&1
 }
 
+ensure_brew_formula_binary() {
+    local formula="$1"
+    local binary="$2"
+
+    if [[ -x "$binary" ]]; then
+        already "binaire Homebrew $binary"
+        return
+    fi
+
+    info "Lien Homebrew manquant pour $formula; tentative de brew link"
+    brew_run link "$formula" ||
+        die "formule $formula installée mais impossible à lier dans $brew_prefix"
+    [[ -x "$binary" ]] ||
+        die "binaire $binary absent après brew link $formula"
+    ok "binaire Homebrew $binary lié et vérifié"
+}
+
 install_brew_tools() {
     local formula
     local -a missing
@@ -621,6 +681,10 @@ install_brew_tools() {
     git_bin="${brew_prefix}/bin/git"
     gh_bin="${brew_prefix}/bin/gh"
     fish_bin="${brew_prefix}/bin/fish"
+
+    ensure_brew_formula_binary git "$git_bin"
+    ensure_brew_formula_binary gh "$gh_bin"
+    ensure_brew_formula_binary fish "$fish_bin"
 
     require_exec "$git_bin"
     require_exec "$gh_bin"
@@ -688,16 +752,40 @@ expected_debian_arch() {
     esac
 }
 
+file_sha256() {
+    local file="$1"
+    local output
+
+    require_cmd sha256sum
+    output="$(sha256sum "$file")" || return 1
+    printf '%s\n' "${output%% *}"
+}
+
+gh_apt_keyring_valid() {
+    local actual_hash
+
+    [[ -s "$GH_APT_KEYRING" && -r "$GH_APT_KEYRING" ]] || return 1
+    actual_hash="$(file_sha256 "$GH_APT_KEYRING" 2>/dev/null)" || return 1
+    [[ "$actual_hash" == "$GH_APT_KEY_SHA256" ]]
+}
+
 gh_apt_repo_configured() {
     local expected_source="$1"
     local actual_source
 
-    [[ -s "$GH_APT_KEYRING" ]] || return 1
-    [[ -r "$GH_APT_KEYRING" ]] || return 1
+    gh_apt_keyring_valid || return 1
     [[ -r "$GH_APT_SOURCE" ]] || return 1
 
     actual_source="$(<"$GH_APT_SOURCE")" || return 1
     [[ "$actual_source" == "$expected_source" ]]
+}
+
+official_gh_deb_installed() {
+    local maintainer
+
+    deb_package_installed gh || return 1
+    maintainer="$(dpkg-query -W -f='${Maintainer}' gh 2>/dev/null || true)"
+    [[ "$maintainer" == "GitHub" ]]
 }
 
 configure_github_cli_apt_repo() {
@@ -730,12 +818,14 @@ configure_github_cli_apt_repo() {
     curl -fsSL "$GH_APT_KEY_URL" -o "$tmp_file" ||
         die "téléchargement du keyring GitHub CLI impossible"
     [[ -s "$tmp_file" ]] || die "keyring GitHub CLI téléchargé vide"
-    ok "keyring GitHub CLI téléchargé et non vide"
+    assert_eq "$(file_sha256 "$tmp_file")" "$GH_APT_KEY_SHA256" \
+        "SHA-256 du keyring GitHub CLI téléchargé"
+    ok "keyring GitHub CLI téléchargé et empreinte SHA-256 vérifiée"
 
     as_root install -m 0644 "$tmp_file" "$GH_APT_KEYRING" ||
         die "installation du keyring GitHub CLI impossible"
-    [[ -s "$GH_APT_KEYRING" && -r "$GH_APT_KEYRING" ]] ||
-        die "keyring GitHub CLI non lisible après installation"
+    gh_apt_keyring_valid ||
+        die "keyring GitHub CLI invalide après installation"
     ok "keyring GitHub CLI installé et vérifié"
 
     printf '%s\n' "$expected_source" > "$tmp_file" ||
@@ -781,6 +871,7 @@ install_debian_tools() {
     require_cmd apt-cache
     require_cmd dpkg
     require_cmd dpkg-query
+    require_cmd sha256sum
 
     apt_output="$(apt-get --version)" || die "apt-get inutilisable"
     assert_nonempty "$apt_output" "version apt-get"
@@ -792,7 +883,7 @@ install_debian_tools() {
     configure_github_cli_apt_repo
 
     missing=()
-    for package in git gh fish; do
+    for package in git fish; do
         if deb_package_installed "$package"; then
             already "paquet APT $package"
         else
@@ -800,9 +891,9 @@ install_debian_tools() {
         fi
     done
 
-    # If the official gh repository was just introduced, explicitly let APT
-    # converge gh to the official candidate even if a community gh was present.
-    if [[ "$gh_apt_repo_changed" == "true" && " ${missing[*]} " != *" gh "* ]]; then
+    if official_gh_deb_installed && [[ "$gh_apt_repo_changed" == "false" ]]; then
+        already "paquet APT officiel GitHub CLI gh"
+    else
         missing+=("gh")
     fi
 
@@ -823,6 +914,8 @@ install_debian_tools() {
         deb_package_installed "$package" ||
             die "paquet APT absent après installation: $package"
     done
+    official_gh_deb_installed ||
+        die "le paquet gh installé n'est pas le paquet officiel GitHub attendu"
 
     verify_debian_binary_owner git git
     verify_debian_binary_owner gh gh
@@ -956,6 +1049,16 @@ install_core_tools() {
 # Persistent Homebrew PATH for installed shells
 # -----------------------------------------------------------------------------
 
+brew_shellenv_invocation() {
+    local shell_kind="$1"
+
+    if [[ "$family" == "macos" && "$cpu" == "arm64" ]]; then
+        printf '/usr/bin/arch -arm64 %s shellenv %s\n' "$brew_bin" "$shell_kind"
+    else
+        printf '%s shellenv %s\n' "$brew_bin" "$shell_kind"
+    fi
+}
+
 ensure_exact_line() {
     local rc_file="$1"
     local line="$2"
@@ -1003,7 +1106,7 @@ verify_shellenv_effect() {
 
     case "$shell_kind" in
         bash)
-            test_command="eval \"\$(${brew_bin} shellenv bash)\"; printf '__SETUP_BREW__%s\\n' \"\$(command -v brew)\""
+            test_command="eval \"\$($(brew_shellenv_invocation bash))\"; printf '__SETUP_BREW__%s\\n' \"\$(command -v brew)\""
             if ! raw_output="$(
                 HOME="$test_home" PATH="/usr/bin:/bin" \
                     run_native_if_needed "$shell_path" --noprofile --norc -c "$test_command"
@@ -1013,7 +1116,7 @@ verify_shellenv_effect() {
             fi
             ;;
         zsh)
-            test_command="eval \"\$(${brew_bin} shellenv zsh)\"; printf '__SETUP_BREW__%s\\n' \"\$(command -v brew)\""
+            test_command="eval \"\$($(brew_shellenv_invocation zsh))\"; printf '__SETUP_BREW__%s\\n' \"\$(command -v brew)\""
             if ! raw_output="$(
                 HOME="$test_home" ZDOTDIR="$test_home" PATH="/usr/bin:/bin" \
                     run_native_if_needed "$shell_path" -f -c "$test_command"
@@ -1023,7 +1126,7 @@ verify_shellenv_effect() {
             fi
             ;;
         fish)
-            test_command="eval (${brew_bin} shellenv fish); printf '__SETUP_BREW__%s\\n' (command -v brew)"
+            test_command="eval ($(brew_shellenv_invocation fish)); printf '__SETUP_BREW__%s\\n' (command -v brew)"
             if ! raw_output="$(
                 HOME="$test_home" XDG_CONFIG_HOME="$test_home" PATH="/usr/bin:/bin" \
                     run_native_if_needed "$shell_path" -c "$test_command"
@@ -1053,8 +1156,9 @@ verify_shellenv_effect() {
 
 configure_bash_brew_path() {
     local bash_path
-    local rc_file
+    local login_rc
     local line
+    local invocation
 
     bash_path="$(command -v bash 2>/dev/null || true)"
     if [[ -z "$bash_path" ]]; then
@@ -1062,21 +1166,27 @@ configure_bash_brew_path() {
         return
     fi
 
-    if [[ "$family" == "macos" ]]; then
-        rc_file="$HOME/.bash_profile"
+    if [[ -f "$HOME/.bash_profile" ]]; then
+        login_rc="$HOME/.bash_profile"
+    elif [[ -f "$HOME/.bash_login" ]]; then
+        login_rc="$HOME/.bash_login"
     else
-        rc_file="$HOME/.bashrc"
+        login_rc="$HOME/.profile"
     fi
+
     brew_run shellenv bash >/dev/null || die "brew shellenv bash non supporté"
-    line="eval \"\$(${brew_bin} shellenv bash)\""
-    ensure_exact_line "$rc_file" "$line" "brew shellenv bash"
+    invocation="$(brew_shellenv_invocation bash)"
+    line="eval \"\$(${invocation})\""
+
+    ensure_exact_line "$login_rc" "$line" "brew shellenv bash (login)"
+    ensure_exact_line "$HOME/.bashrc" "$line" "brew shellenv bash (interactif)"
     verify_shellenv_effect bash "$bash_path"
 }
 
 configure_zsh_brew_path() {
     local zsh_path
-    local rc_file
     local line
+    local invocation
 
     zsh_path="$(command -v zsh 2>/dev/null || true)"
     if [[ -z "$zsh_path" ]]; then
@@ -1084,24 +1194,37 @@ configure_zsh_brew_path() {
         return
     fi
 
-    if [[ "$family" == "macos" ]]; then
-        rc_file="$HOME/.zprofile"
-    else
-        rc_file="$HOME/.zshrc"
-    fi
     brew_run shellenv zsh >/dev/null || die "brew shellenv zsh non supporté"
-    line="eval \"\$(${brew_bin} shellenv zsh)\""
-    ensure_exact_line "$rc_file" "$line" "brew shellenv zsh"
+    invocation="$(brew_shellenv_invocation zsh)"
+    line="eval \"\$(${invocation})\""
+
+    ensure_exact_line "$HOME/.zprofile" "$line" "brew shellenv zsh (login)"
+    ensure_exact_line "$HOME/.zshrc" "$line" "brew shellenv zsh (interactif)"
     verify_shellenv_effect zsh "$zsh_path"
 }
 
 configure_fish_brew_path() {
-    local fish_dir="$HOME/.config/fish"
-    local rc_file="$fish_dir/config.fish"
-    local line="eval (${brew_bin} shellenv fish)"
+    local config_home
+    local fish_dir
+    local rc_file
+    local invocation
+    local line
 
     brew_run shellenv fish >/dev/null || die "brew shellenv fish non supporté"
     [[ -x "$fish_bin" ]] || die "Fish Homebrew attendu mais absent: $fish_bin"
+
+    if [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+        [[ "$XDG_CONFIG_HOME" == /* ]] ||
+            die "XDG_CONFIG_HOME doit être absolu pour Fish: $XDG_CONFIG_HOME"
+        config_home="$XDG_CONFIG_HOME"
+    else
+        config_home="$HOME/.config"
+    fi
+
+    fish_dir="$config_home/fish"
+    rc_file="$fish_dir/config.fish"
+    invocation="$(brew_shellenv_invocation fish)"
+    line="eval (${invocation})"
 
     if [[ -e "$fish_dir" && ! -d "$fish_dir" ]]; then
         die "$fish_dir existe mais n'est pas un dossier"
@@ -1223,17 +1346,17 @@ ensure_github_auth() {
         ok "protocole GitHub CLI HTTPS vérifié"
     fi
 
-    helper_needle="${gh_bin} auth git-credential"
+    helper_needle="!${gh_bin} auth git-credential"
     helper_output="$("$git_bin" config --global --get-all credential.https://github.com.helper 2>/dev/null || true)"
-    if printf '%s\n' "$helper_output" | grep -F "$helper_needle" >/dev/null 2>&1; then
+    if [[ "$helper_output" == $'\n'"$helper_needle" ]]; then
         already "credential helper GitHub CLI pour Git"
     else
         info "Configuration du credential helper GitHub CLI"
         gh_run auth setup-git --hostname github.com --force ||
             die "gh auth setup-git a échoué"
         helper_output="$("$git_bin" config --global --get-all credential.https://github.com.helper 2>/dev/null || true)"
-        printf '%s\n' "$helper_output" | grep -F "$helper_needle" >/dev/null 2>&1 ||
-            die "credential helper GitHub CLI absent après gh auth setup-git"
+        [[ "$helper_output" == $'\n'"$helper_needle" ]] ||
+            die "credential helper GitHub CLI incorrect après gh auth setup-git"
         ok "credential helper GitHub CLI vérifié"
     fi
 }
