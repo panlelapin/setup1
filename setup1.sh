@@ -170,15 +170,21 @@ set -euo pipefail
 #
 # OUTPUT POLICY
 # -------------
-# Normal successful output MUST stay minimal. For a step that is executed, print
-# only one action prefix and its final result on the same line, for example:
-#     ==> Installation de git, gh et fish... OK
-# For an idempotent step that is already satisfied, print only:
+# Every setup step MUST produce exactly one final status line. The action and its
+# result MUST be on that same line. There are exactly three result labels:
+#   - `fait`       : green
+#   - `déjà fait` : green
+#   - `ERREUR`     : red
+# Examples:
+#     ==> Installation de git, gh et fish... fait
 #     ==> git, gh et fish... déjà fait
-# Do not print environment reports, versions, verification chatter, package-
-# manager progress, download progress or successful command output. External
-# command stdout/stderr MUST be captured; reveal it only when that command fails,
-# immediately before the fatal ERROR line. The sole intentional interactive
+#     ==> Installation de git, gh et fish... ERREUR: <raison>
+# The result label is colored with literal ANSI escape sequences; do not depend
+# on `tput`, terminfo, or any external color helper. Do not print environment
+# reports, versions, verification chatter, package-manager progress, download
+# progress, successful command output, or captured command diagnostics. A failed
+# external command is summarized by the explicit fatal error for its setup step,
+# keeping that action and `ERREUR` on one line. The sole intentional interactive
 # exception is `gh auth login --web` when GitHub authentication is not already
 # valid; its browser instructions/device code must remain visible. A sudo password
 # prompt may also remain visible when privilege escalation is genuinely required.
@@ -188,25 +194,53 @@ set -euo pipefail
 # Logging / assertions
 # -----------------------------------------------------------------------------
 
+readonly COLOR_GREEN=$'\033[32m'
+readonly COLOR_RED=$'\033[31m'
+readonly COLOR_RESET=$'\033[0m'
+
+current_action=""
+
 die() {
-    printf 'ERROR: %s\n' "$*" >&2
+    local message="$*"
+
+    if [[ -n "${current_action:-}" ]]; then
+        printf '==> %s... %sERREUR%s: %s\n' \
+            "$current_action" "$COLOR_RED" "$COLOR_RESET" "$message" >&2
+        current_action=""
+    else
+        printf '%sERREUR%s: %s\n' \
+            "$COLOR_RED" "$COLOR_RESET" "$message" >&2
+    fi
     exit 1
 }
 
+# Buffer the action instead of printing it immediately. This guarantees that the
+# action and its final status are emitted atomically on one line.
 info() {
-    printf '==> %s... ' "$*"
+    current_action="$*"
 }
 
+# Interactive steps still buffer their action. gh/sudo may print their required
+# prompts first; the setup status itself remains a single final line.
 interactive_info() {
-    printf '==> %s...\n' "$*"
+    current_action="$*"
 }
 
 ok() {
-    printf 'OK\n'
+    local action="$current_action"
+
+    [[ -n "$action" ]] || die "résultat 'fait' sans action active"
+    printf '==> %s... %sfait%s\n' \
+        "$action" "$COLOR_GREEN" "$COLOR_RESET"
+    current_action=""
 }
 
 already() {
-    printf '==> %s... déjà fait\n' "$*"
+    local action="$*"
+
+    current_action=""
+    printf '==> %s... %sdéjà fait%s\n' \
+        "$action" "$COLOR_GREEN" "$COLOR_RESET"
 }
 
 run_quiet() {
@@ -221,9 +255,8 @@ run_quiet() {
         status=$?
     fi
 
-    if [[ -s "$log_file" ]]; then
-        cat "$log_file" >&2 || true
-    fi
+    # Keep setup output to the one-line status contract. The caller supplies the
+    # precise fatal message for this failed command.
     rm -f "$log_file" || true
     return "$status"
 }
@@ -613,14 +646,14 @@ install_homebrew() {
     require_exec /bin/bash
     tmp_file="$(mktemp)" || die "mktemp a échoué"
 
+    if [[ "$family" == "macos" ]]; then
+        ensure_macos_sudo_for_homebrew
+    fi
+
     info "Installation de Homebrew dans $brew_prefix"
     curl -fsSL "$HOMEBREW_INSTALL_URL" -o "$tmp_file" ||
         die "téléchargement de l'installateur Homebrew impossible"
     [[ -s "$tmp_file" ]] || die "installateur Homebrew téléchargé vide"
-
-    if [[ "$family" == "macos" ]]; then
-        ensure_macos_sudo_for_homebrew
-    fi
 
     if [[ "$family" == "macos" && "$cpu" == "arm64" &&
           "$process_cpu" == "x86_64" ]]; then
